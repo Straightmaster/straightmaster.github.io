@@ -1,6 +1,8 @@
 #  Win11 vectored handlers: Internals, dumping and manually registering
 Written by: [DIMM](https://discordlookup.com/user/1335235086874054686)
+
 I spent my days rotting behind a computer screen reversing ntdll 
+
 ![me asf](https://cdn.discordapp.com/emojis/1339753068539019306.webp?size=32)
 ## Index and intro
 
