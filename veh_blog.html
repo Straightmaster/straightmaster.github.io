@@ -106,7 +106,7 @@ Anyway lets get into it!</p>
 <span class="token comment">// 16 bytes (sizeof)</span>
 <span class="token keyword">struct</span> vectored_handler_entrypoint <span class="token comment">// structure found at NTDLL+LdrpVectoredHandlerList+ 8 + 8 * (type*3)</span>
 <span class="token punctuation">{</span>
-    <span class="token comment">    //first handler to be called</span>
+   	<span class="token comment">//first handler to be called</span>
 	<span class="token comment">//NOTE: the first handler to be called will have the address of the vectored_handler_entrypoint as blink</span>
         vectored_handler<span class="token operator">*</span> first<span class="token punctuation">;</span>
     
