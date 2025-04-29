@@ -1,0 +1,427 @@
+﻿<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Welcome file</title>
+  <link rel="stylesheet" href="https://stackedit.io/style.css" />
+</head>
+<style>
+	  body {
+		background-color: #121212;
+		color: #ffffff; /* White text */
+		font-family: sans-serif;
+		line-height: 1.6;
+		padding: 2rem;
+	  }
+	  a {
+		color: #90caf9;
+	  }
+	  pre, code {
+		background-color: #1e1e1e;
+		color: #ffffff;
+		padding: 0.5em;
+		border-radius: 5px;
+		overflow-x: auto;
+	  }
+	  blockquote {
+		border-left: 4px solid #555;
+		padding-left: 1em;
+		color: #cccccc;
+	  }
+	  .button:hover
+	  {
+		background-color: #000000;
+	  }
+	  
+</style>
+<body class="stackedit">
+  <div class="stackedit__left">
+    <div class="stackedit__toc">
+      
+<ul>
+<li><a href="#win11-vectored-handlers-internals-dumping-and-manually-registering">Win11 vectored handlers: Internals, dumping and manually registering</a>
+<ul>
+<li><a href="#index-and-intro">Index and intro</a></li>
+</ul>
+</li>
+<li><a href="#general-workings">General workings</a>
+<ul>
+<li><a href="#structures-used">Structures used:</a></li>
+<li><a href="#control-flow-simplified-but-accurate-enough">Control flow (Simplified but accurate enough)</a></li>
+</ul>
+</li>
+<li><a href="#ldrpvectorhandlerlist-and-how-to-exploit-it">LdrpVectorHandlerList and how to exploit it</a>
+<ul>
+<li><a href="#dumping-vectored_handler-structs">Dumping vectored_handler structs</a></li>
+<li><a href="#rtlencodepointer-and-rtldecodepointer-inner-workings">RtlEncodePointer and RtlDecodePointer inner workings</a></li>
+<li><a href="#veh-injection">VEH injection</a></li>
+</ul>
+</li>
+<li><a href="#important-notes">IMPORTANT NOTES</a></li>
+<li><a href="#references">References</a></li>
+</ul>
+
+    </div>
+  </div>
+  <div class="stackedit__right">
+    <div class="stackedit__html">
+      <h1 id="win11-vectored-handlers-internals-dumping-and-manually-registering">Win11 vectored handlers: Internals, dumping and manually registering</h1>
+<p>Written by: <a href="https://discordlookup.com/user/1335235086874054686">DIMM</a><br>
+I spent my days rotting behind a computer screen reversing ntdll<br>
+<img src="https://cdn.discordapp.com/emojis/1339753068539019306.webp?size=32" alt="me asf"></p>
+<h2 id="index-and-intro">Index and intro</h2>
+<p>Hello and welcome to my first public blog!<br>
+Really excited to write this one, pretty cool subject :)<br>
+Today we’re exploring vectored handlers!<br>
+Mainly VEH since i haven’t really looked into VCH…<br>
+Anyway lets get into it!</p>
+<p>WinVer: Windows 11 24h2 (Since this blog talks about ntdll its version-specific)</p>
+<ol start="0">
+<li>Index and intro</li>
+<li>General workings of AddVectored(Exception/Continue)Handler</li>
+<li>LdrpVectorHandlerList and how to exploit it<br>
+2.1. Dumping vectored_handler structs<br>
+2.2. RtlEncodePointer and RtlDecodePointer’s inner workings<br>
+2.3 VEH injection</li>
+<li>IMPORTANT NOTES</li>
+<li>References</li>
+</ol>
+<h1 id="general-workings">General workings</h1>
+<h2 id="structures-used">Structures used:</h2>
+<pre class=" language-c"><code class="prism ++ language-c"><span class="token comment">//Both structures were found by reversing ntdll.RtlpAddVectoredHandler and ntdll.RtlpCallVectoredHandlers</span>
+
+<span class="token comment">//40 bytes (sizeof, ntdll.RtlpAddVectoredHandler RtlHeapAlloc call)</span>
+<span class="token keyword">struct</span> vectored_handler
+<span class="token punctuation">{</span>
+	<span class="token comment">//aka a LIST_ENTRY instance</span>
+	vectored_handler<span class="token operator">*</span> flink<span class="token punctuation">;</span> <span class="token comment">//next handler to be called </span>
+	vectored_handler<span class="token operator">*</span> blink<span class="token punctuation">;</span> <span class="token comment">//previous handler called</span>
+	uintptr_t<span class="token operator">*</span> unkown_ptr<span class="token punctuation">;</span>   <span class="token comment">//needs to be pointing to a QWORD with value 1</span>
+	PVOID unused<span class="token punctuation">;</span>            <span class="token comment">//unused(?), this and unkown_ptr need more research</span>
+	PVOID encoded_ptr<span class="token punctuation">;</span>       <span class="token comment">//encoded pointer to vectored handler code</span>
+<span class="token punctuation">}</span><span class="token punctuation">;</span>
+
+<span class="token comment">// 16 bytes (sizeof)</span>
+<span class="token keyword">struct</span> vectored_handler_entrypoint <span class="token comment">// structure found at NTDLL+LdrpVectoredHandlerList+ 8 + 8 * (type*3)</span>
+<span class="token punctuation">{</span>
+    <span class="token comment">//first handler to be called</span>
+	<span class="token comment">//NOTE: the first handler to be called will have the address of the vectored_handler_entrypoint as blink</span>
+    vectored_handler<span class="token operator">*</span> first<span class="token punctuation">;</span>
+    
+	<span class="token comment">//last handler to be called </span>
+	<span class="token comment">//NOTE: the last handler to be called will have the address of the vectored_handler_entrypoint as flink</span>
+	vectored_handler<span class="token operator">*</span> last<span class="token punctuation">;</span>
+<span class="token punctuation">}</span><span class="token punctuation">;</span>
+
+</code></pre>
+<h2 id="control-flow-simplified-but-accurate-enough">Control flow (Simplified but accurate enough)</h2>
+<pre class=" language-mermaid"><svg id="mermaid-svg-mVXG0wucHb1iLGfA" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" height="955.1666259765625" style="max-width: 840.9166259765625px;" viewBox="0 0 840.9166259765625 955.1666259765625"><style>#mermaid-svg-mVXG0wucHb1iLGfA{font-family:"trebuchet ms",verdana,arial,sans-serif;font-size:16px;fill:#ccc;}#mermaid-svg-mVXG0wucHb1iLGfA .error-icon{fill:#a44141;}#mermaid-svg-mVXG0wucHb1iLGfA .error-text{fill:#ddd;stroke:#ddd;}#mermaid-svg-mVXG0wucHb1iLGfA .edge-thickness-normal{stroke-width:2px;}#mermaid-svg-mVXG0wucHb1iLGfA .edge-thickness-thick{stroke-width:3.5px;}#mermaid-svg-mVXG0wucHb1iLGfA .edge-pattern-solid{stroke-dasharray:0;}#mermaid-svg-mVXG0wucHb1iLGfA .edge-pattern-dashed{stroke-dasharray:3;}#mermaid-svg-mVXG0wucHb1iLGfA .edge-pattern-dotted{stroke-dasharray:2;}#mermaid-svg-mVXG0wucHb1iLGfA .marker{fill:lightgrey;stroke:lightgrey;}#mermaid-svg-mVXG0wucHb1iLGfA .marker.cross{stroke:lightgrey;}#mermaid-svg-mVXG0wucHb1iLGfA svg{font-family:"trebuchet ms",verdana,arial,sans-serif;font-size:16px;}#mermaid-svg-mVXG0wucHb1iLGfA .label{font-family:"trebuchet ms",verdana,arial,sans-serif;color:#ccc;}#mermaid-svg-mVXG0wucHb1iLGfA .cluster-label text{fill:#F9FFFE;}#mermaid-svg-mVXG0wucHb1iLGfA .cluster-label span{color:#F9FFFE;}#mermaid-svg-mVXG0wucHb1iLGfA .label text,#mermaid-svg-mVXG0wucHb1iLGfA span{fill:#ccc;color:#ccc;}#mermaid-svg-mVXG0wucHb1iLGfA .node rect,#mermaid-svg-mVXG0wucHb1iLGfA .node circle,#mermaid-svg-mVXG0wucHb1iLGfA .node ellipse,#mermaid-svg-mVXG0wucHb1iLGfA .node polygon,#mermaid-svg-mVXG0wucHb1iLGfA .node path{fill:#1f2020;stroke:#81B1DB;stroke-width:1px;}#mermaid-svg-mVXG0wucHb1iLGfA .node .label{text-align:center;}#mermaid-svg-mVXG0wucHb1iLGfA .node.clickable{cursor:pointer;}#mermaid-svg-mVXG0wucHb1iLGfA .arrowheadPath{fill:lightgrey;}#mermaid-svg-mVXG0wucHb1iLGfA .edgePath .path{stroke:lightgrey;stroke-width:1.5px;}#mermaid-svg-mVXG0wucHb1iLGfA .flowchart-link{stroke:lightgrey;fill:none;}#mermaid-svg-mVXG0wucHb1iLGfA .edgeLabel{background-color:hsl(0,0%,34.4117647059%);text-align:center;}#mermaid-svg-mVXG0wucHb1iLGfA .edgeLabel rect{opacity:0.5;background-color:hsl(0,0%,34.4117647059%);fill:hsl(0,0%,34.4117647059%);}#mermaid-svg-mVXG0wucHb1iLGfA .cluster rect{fill:hsl(180,1.5873015873%,28.3529411765%);stroke:rgba(255,255,255,0.25);stroke-width:1px;}#mermaid-svg-mVXG0wucHb1iLGfA .cluster text{fill:#F9FFFE;}#mermaid-svg-mVXG0wucHb1iLGfA .cluster span{color:#F9FFFE;}#mermaid-svg-mVXG0wucHb1iLGfA div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:"trebuchet ms",verdana,arial,sans-serif;font-size:12px;background:hsl(20,1.5873015873%,12.3529411765%);border:1px solid rgba(255,255,255,0.25);border-radius:2px;pointer-events:none;z-index:100;}#mermaid-svg-mVXG0wucHb1iLGfA .edgeLabel{background-color:#252525;}#mermaid-svg-mVXG0wucHb1iLGfA .edgeLabel:root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}#mermaid-svg-mVXG0wucHb1iLGfA .edgeLabel flowchart-v2{fill:apa;}</style><g transform="translate(0, -0.000003814697265625)"><marker id="flowchart-pointEnd" class="marker flowchart" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"></path></marker><marker id="flowchart-pointStart" class="marker flowchart" viewBox="0 0 10 10" refX="0" refY="5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"></path></marker><marker id="flowchart-circleEnd" class="marker flowchart" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"></circle></marker><marker id="flowchart-circleStart" class="marker flowchart" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"></circle></marker><marker id="flowchart-crossEnd" class="marker cross flowchart" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"></path></marker><marker id="flowchart-crossStart" class="marker cross flowchart" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"></path></marker><g class="root"><g class="clusters"></g><g class="edgePaths"><path d="M420.4583435058594,76.41666412353516L420.4583435058594,82.80902528762817C420.4583435058594,89.20138645172119,420.4583435058594,101.98610877990723,420.4583435058594,114.77083110809326C420.4583435058594,127.5555534362793,420.4583435058594,140.34027576446533,420.4583435058594,146.73263692855835L420.4583435058594,153.12499809265137" id="L-Phase0-Phase1" class=" edge-thickness-normal edge-pattern-solid flowchart-link LS-Phase0 LE-Phase1" style="fill:none;" marker-end="url(#flowchart-pointEnd)"></path><path d="M420.4583435058594,221.54166221618652L420.4583435058594,227.93402338027954C420.4583435058594,234.32638454437256,420.4583435058594,247.1111068725586,420.4583435058594,259.89582920074463C420.4583435058594,272.68055152893066,420.4583435058594,285.4652738571167,420.4583435058594,291.8576350212097L420.4583435058594,298.24999618530273" id="L-Phase1-Phase2" class=" edge-thickness-normal edge-pattern-solid flowchart-link LS-Phase1 LE-Phase2" style="fill:none;" marker-end="url(#flowchart-pointEnd)"></path><path d="M340.88443822450535,366.6666603088379L326.0148111150256,373.0590214729309C311.1451840055459,379.4513826370239,281.40592978658646,392.23610496520996,266.5363026771067,405.020827293396C251.66667556762695,417.80554962158203,251.66667556762695,430.59027194976807,251.66667556762695,436.9826331138611L251.66667556762695,443.3749942779541" id="L-Phase2-Phase3.1" class=" edge-thickness-normal edge-pattern-solid flowchart-link LS-Phase2 LE-Phase3.1" style="fill:none;" marker-end="url(#flowchart-pointEnd)"></path><path d="M500.0322487872134,366.6666603088379L514.9018758966931,373.0590214729309C529.7715030061728,379.4513826370239,559.5107572251324,392.23610496520996,574.3803843346121,405.020827293396C589.2500114440918,417.80554962158203,589.2500114440918,430.59027194976807,589.2500114440918,436.9826331138611L589.2500114440918,443.3749942779541" id="L-Phase2-Phase3.2" class=" edge-thickness-normal edge-pattern-solid flowchart-link LS-Phase2 LE-Phase3.2" style="fill:none;" marker-end="url(#flowchart-pointEnd)"></path><path d="M251.66667556762695,485.0833263397217L251.66667556762695,489.24999300638837C251.66667556762695,493.416659673055,251.66667556762695,501.74999300638837,257.91128037481275,510.0833263397217C264.1558851819986,518.416659673055,276.6450947963702,526.7499930063883,282.88969960355604,530.916659673055L289.13430441074183,535.0833263397217" id="L-Phase3.1-Phase4" class=" edge-thickness-normal edge-pattern-solid flowchart-link LS-Phase3.1 LE-Phase4" style="fill:none;" marker-end="url(#flowchart-pointEnd)"></path><path d="M589.2500114440918,485.0833263397217L589.2500114440918,489.24999300638837C589.2500114440918,493.416659673055,589.2500114440918,501.74999300638837,583.0054066369061,510.0833263397217C576.7608018297202,518.416659673055,564.2715922153485,526.7499930063883,558.0269874081628,530.916659673055L551.7823826009769,535.0833263397217" id="L-Phase3.2-Phase4" class=" edge-thickness-normal edge-pattern-solid flowchart-link LS-Phase3.2 LE-Phase4" style="fill:none;" marker-end="url(#flowchart-pointEnd)"></path><path d="M268.320937507614,710.3333263397217L257.22230988183327,716.7256875038147C246.12368225605258,723.1180486679077,223.9264270044911,735.9027709960938,212.8277993787104,748.6874933242798C201.7291717529297,761.4722156524658,201.7291717529297,774.2569379806519,201.7291717529297,780.6492991447449L201.7291717529297,787.0416603088379" id="L-Phase4-Phase5.1" class=" edge-thickness-normal edge-pattern-solid flowchart-link LS-Phase4 LE-Phase5.1" style="fill:none;" marker-end="url(#flowchart-pointEnd)"></path><path d="M572.5957495041048,710.3333263397217L583.6943771298855,716.7256875038147C594.7930047556662,723.1180486679077,616.9902600072277,735.9027709960938,628.0888876330083,748.6874933242798C639.1875152587891,761.4722156524658,639.1875152587891,774.2569379806519,639.1875152587891,780.6492991447449L639.1875152587891,787.0416603088379" id="L-Phase4-Phase5.2" class=" edge-thickness-normal edge-pattern-solid flowchart-link LS-Phase4 LE-Phase5.2" style="fill:none;" marker-end="url(#flowchart-pointEnd)"></path><path d="M201.7291717529297,855.458324432373L201.7291717529297,859.6249910990397C201.7291717529297,863.7916577657064,201.7291717529297,872.1249910990397,227.5937557220459,881.7138834255707C253.4583396911621,891.3027757521016,305.18750762939453,902.1472270718301,331.05209159851074,907.5694527316945L356.91667556762695,912.9916783915586" id="L-Phase5.1-done" class=" edge-thickness-normal edge-pattern-solid flowchart-link LS-Phase5.1 LE-done" style="fill:none;" marker-end="url(#flowchart-pointEnd)"></path><path d="M639.1875152587891,855.458324432373L639.1875152587891,859.6249910990397C639.1875152587891,863.7916577657064,639.1875152587891,872.1249910990397,613.3229312896729,881.7138834255707C587.4583473205566,891.3027757521016,535.7291793823242,902.1472270718301,509.864595413208,907.5694527316945L484.0000114440918,912.9916783915586" id="L-Phase5.2-done" class=" edge-thickness-normal edge-pattern-solid flowchart-link LS-Phase5.2 LE-done" style="fill:none;" marker-end="url(#flowchart-pointEnd)"></path></g><g class="edgeLabels"><g class="edgeLabel" transform="translate(420.4583435058594, 114.77083110809326)"><g class="label" transform="translate(-73.30208587646484, -13.354166984558105)"><foreignObject width="146.6041717529297" height="26.70833396911621"><div xmlns="http://www.w3.org/1999/xhtml" style="display: inline-block; white-space: nowrap;"><span class="edgeLabel">FORWARDED EXPORT</span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(420.4583435058594, 259.89582920074463)"><g class="label" transform="translate(-21.45833396911621, -13.354166984558105)"><foreignObject width="42.91666793823242" height="26.70833396911621"><div xmlns="http://www.w3.org/1999/xhtml" style="display: inline-block; white-space: nowrap;"><span class="edgeLabel">CALLS</span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(251.66667556762695, 405.020827293396)"><g class="label" transform="translate(-121.625, -13.354166984558105)"><foreignObject width="243.25" height="26.70833396911621"><div xmlns="http://www.w3.org/1999/xhtml" style="display: inline-block; white-space: nowrap;"><span class="edgeLabel">If LdrControlFlowGuardEnforced()</span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(589.2500114440918, 405.020827293396)"><g class="label" transform="translate(-14.25, -13.354166984558105)"><foreignObject width="28.5" height="26.70833396911621"><div xmlns="http://www.w3.org/1999/xhtml" style="display: inline-block; white-space: nowrap;"><span class="edgeLabel">Else</span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" style="display: inline-block; white-space: nowrap;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" style="display: inline-block; white-space: nowrap;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(201.7291717529297, 748.6874933242798)"><g class="label" transform="translate(-36.677085876464844, -13.354166984558105)"><foreignObject width="73.35417175292969" height="26.70833396911621"><div xmlns="http://www.w3.org/1999/xhtml" style="display: inline-block; white-space: nowrap;"><span class="edgeLabel">if arg.first</span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(639.1875152587891, 748.6874933242798)"><g class="label" transform="translate(-14.333333969116211, -13.354166984558105)"><foreignObject width="28.666667938232422" height="26.70833396911621"><div xmlns="http://www.w3.org/1999/xhtml" style="display: inline-block; white-space: nowrap;"><span class="edgeLabel">else</span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" style="display: inline-block; white-space: nowrap;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" style="display: inline-block; white-space: nowrap;"><span class="edgeLabel"></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default default" id="flowchart-Phase0-11195" transform="translate(420.4583435058594, 42.20833206176758)"><rect class="basic label-container" style="" rx="0" ry="0" x="-192.65625" y="-34.20833396911621" width="385.3125" height="68.41666793823242"></rect><g class="label" style="" transform="translate(-185.15625, -26.70833396911621)"><foreignObject width="370.3125" height="53.41666793823242"><div xmlns="http://www.w3.org/1999/xhtml" style="display: inline-block; white-space: nowrap;"><span class="nodeLabel">Kernel32.AddVectored(Exception/Continue)Handler<br>ARGS(First,Handler)</span></div></foreignObject></g></g><g class="node default default" id="flowchart-Phase1-11196" transform="translate(420.4583435058594, 187.33333015441895)"><rect class="basic label-container" style="" rx="0" ry="0" x="-188.25" y="-34.20833396911621" width="376.5" height="68.41666793823242"></rect><g class="label" style="" transform="translate(-180.75, -26.70833396911621)"><foreignObject width="361.5" height="53.41666793823242"><div xmlns="http://www.w3.org/1999/xhtml" style="display: inline-block; white-space: nowrap;"><span class="nodeLabel">ntdll.RtlAddVectored(Exception/Continue)Handler<br>ARGS(First,Handler)</span></div></foreignObject></g></g><g class="node default default" id="flowchart-Phase2-11197" transform="translate(420.4583435058594, 332.4583282470703)"><rect class="basic label-container" style="" rx="0" ry="0" x="-200.96875" y="-34.20833396911621" width="401.9375" height="68.41666793823242"></rect><g class="label" style="" transform="translate(-193.46875, -26.70833396911621)"><foreignObject width="386.9375" height="53.41666793823242"><div xmlns="http://www.w3.org/1999/xhtml" style="display: inline-block; white-space: nowrap;"><span class="nodeLabel">ntdll.RtlpAddVectoredHandler<br>ARGS(First,Handler,Type(if VEH then 0,if VCH then 1))</span></div></foreignObject></g></g><g class="node default default" id="flowchart-Phase3.1-11199" transform="translate(251.66667556762695, 464.2291603088379)"><rect class="basic label-container" style="" rx="0" ry="0" x="-118.02083587646484" y="-20.854166984558105" width="236.0416717529297" height="41.70833396911621"></rect><g class="label" style="" transform="translate(-110.52083587646484, -13.354166984558105)"><foreignObject width="221.0416717529297" height="26.70833396911621"><div xmlns="http://www.w3.org/1999/xhtml" style="display: inline-block; white-space: nowrap;"><span class="nodeLabel">PVOID Heap = LdrpMrdataHeap</span></div></foreignObject></g></g><g class="node default default" id="flowchart-Phase3.2-11201" transform="translate(589.2500114440918, 464.2291603088379)"><rect class="basic label-container" style="" rx="0" ry="0" x="-169.5625" y="-20.854166984558105" width="339.125" height="41.70833396911621"></rect><g class="label" style="" transform="translate(-162.0625, -13.354166984558105)"><foreignObject width="324.125" height="26.70833396911621"><div xmlns="http://www.w3.org/1999/xhtml" style="display: inline-block; white-space: nowrap;"><span class="nodeLabel">PVOID Heap = GetCurrentPeb()-&gt;ProcessHeap</span></div></foreignObject></g></g><g class="node default default" id="flowchart-Phase4-11203" transform="translate(420.4583435058594, 622.7083263397217)"><rect class="basic label-container" style="" rx="0" ry="0" x="-329.60418701171875" y="-87.625" width="659.2083740234375" height="175.25"></rect><g class="label" style="" transform="translate(-322.10418701171875, -80.125)"><foreignObject width="644.2083740234375" height="160.25"><div xmlns="http://www.w3.org/1999/xhtml" style="display: inline-block; white-space: nowrap;"><span class="nodeLabel">vectored_handler_entrypoint* vh_entry = LdrpVectorHandlerList + 8 + 8 * (type*3) <br>vectored_handler* handler = RtlAllocateHeap(Heap,0,sizeof(vectored_handler))<br>handler.unkown_ptr = RtlAllocateHeap(heap,0,8)<br>*handler.unkown_ptr = 1 //if !1 RtlpCallVectoredHandlers fastfails<br>handler.encoded_ptr = RtlEncodePointer(args.Handler)<br>if first entry in LdrpVectorHandlerList then peb.CrossProcessFlags.ProcessUsingVEH = true</span></div></foreignObject></g></g><g class="node default default" id="flowchart-Phase5.1-11208" transform="translate(201.7291717529297, 821.2499923706055)"><rect class="basic label-container" style="" rx="0" ry="0" x="-193.7291717529297" y="-34.20833396911621" width="387.4583435058594" height="68.41666793823242"></rect><g class="label" style="" transform="translate(-186.2291717529297, -26.70833396911621)"><foreignObject width="372.4583435058594" height="53.41666793823242"><div xmlns="http://www.w3.org/1999/xhtml" style="display: inline-block; white-space: nowrap;"><span class="nodeLabel">if vh_entry-&gt;flink-&gt;blink != vh_entry : __fastfail(3u)<br>InsertHeadList(vh_entry,handler)</span></div></foreignObject></g></g><g class="node default default" id="flowchart-Phase5.2-11210" transform="translate(639.1875152587891, 821.2499923706055)"><rect class="basic label-container" style="" rx="0" ry="0" x="-193.7291717529297" y="-34.20833396911621" width="387.4583435058594" height="68.41666793823242"></rect><g class="label" style="" transform="translate(-186.2291717529297, -26.70833396911621)"><foreignObject width="372.4583435058594" height="53.41666793823242"><div xmlns="http://www.w3.org/1999/xhtml" style="display: inline-block; white-space: nowrap;"><span class="nodeLabel">if vh_entry-&gt;blink-&gt;flink != vh_entry : __fastfail(3u)<br>InsertTailList(vh_entry,handler)</span></div></foreignObject></g></g><g class="node default default" id="flowchart-done-11214" transform="translate(420.4583435058594, 926.3124904632568)"><rect class="basic label-container" style="" rx="0" ry="0" x="-63.54166793823242" y="-20.854166984558105" width="127.08333587646484" height="41.70833396911621"></rect><g class="label" style="" transform="translate(-56.04166793823242, -13.354166984558105)"><foreignObject width="112.08333587646484" height="26.70833396911621"><div xmlns="http://www.w3.org/1999/xhtml" style="display: inline-block; white-space: nowrap;"><span class="nodeLabel">cleanup &amp; done</span></div></foreignObject></g></g></g></g></g></svg></pre>
+<h1 id="ldrpvectorhandlerlist-and-how-to-exploit-it">LdrpVectorHandlerList and how to exploit it</h1>
+<h2 id="dumping-vectored_handler-structs">Dumping vectored_handler structs</h2>
+<p>So, as you have probably noticed i’ve been using a variable called LdrpVectorHandlerList in both my control flow chart and in the comments in my structures, and you’ve probably already noticed that it’s a linked list (two actually) of VEH and VCH structures</p>
+<p>LdrpVectorHandlerList  is a hardcoded offset into Ntdll as you can see in the screenshot below:</p>
+<p><img src="https://files.catbox.moe/kywxzo.png" alt="LdrpVectorHandlerList win_11"><br>
+On my version of windows (win 11 24h2) the offset is 0x1E7568 for LdrpVectorHandlerList but we’re actually interested in what comes after that, the two linked lists VEH_list and VCH_list</p>
+<p>Now, as you’ve seen in the control flow chart, the calculation for vh_entry is LdrpVectorHandlerList + 8 + 8 * (type*3),<br>
+type = 1 for VCH and 0 for VEH</p>
+<p>So then the final addresses are:</p>
+<pre class=" language-c"><code class="prism ++ language-c">constexpr <span class="token keyword">unsigned</span> <span class="token keyword">int</span> LdrpVectorHandlerList <span class="token operator">=</span> <span class="token number">0x1E7568</span><span class="token punctuation">;</span> <span class="token comment">//win 11 24h2 offset</span>
+<span class="token keyword">enum</span> type
+<span class="token punctuation">{</span>
+	VEH<span class="token punctuation">,</span>
+	VCH
+<span class="token punctuation">}</span><span class="token punctuation">;</span>
+std<span class="token punctuation">:</span><span class="token punctuation">:</span>uintptr_t ntdll <span class="token operator">=</span> reinterpret_cast<span class="token operator">&lt;</span>std<span class="token punctuation">:</span><span class="token punctuation">:</span>uintptr_t<span class="token operator">&gt;</span><span class="token punctuation">(</span><span class="token function">GetModuleHandleA</span><span class="token punctuation">(</span><span class="token string">"ntdll.dll"</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+vectored_handler_entry<span class="token operator">*</span> VEH_entry <span class="token operator">=</span> reinterpret_cast<span class="token operator">&lt;</span>vectored_handler_entry<span class="token operator">*</span><span class="token operator">&gt;</span><span class="token punctuation">(</span>ntdll <span class="token operator">+</span> LdrpVectorHandlerList <span class="token operator">+</span> <span class="token number">8</span> <span class="token operator">+</span> <span class="token number">8</span> <span class="token operator">*</span> <span class="token punctuation">(</span>type<span class="token punctuation">:</span><span class="token punctuation">:</span>VEH <span class="token operator">*</span> <span class="token number">3</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+vectored_handler_entry<span class="token operator">*</span> VCH_entry <span class="token operator">=</span> reinterpret_cast<span class="token operator">&lt;</span>vectored_handler_entry<span class="token operator">*</span><span class="token operator">&gt;</span><span class="token punctuation">(</span>ntdll <span class="token operator">+</span> LdrpVectorHandlerList <span class="token operator">+</span> <span class="token number">8</span> <span class="token operator">+</span> <span class="token number">8</span> <span class="token operator">*</span> <span class="token punctuation">(</span>type<span class="token punctuation">:</span><span class="token punctuation">:</span>VCH <span class="token operator">*</span> <span class="token number">3</span><span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+</code></pre>
+<p>LdrpAddVectoredHandler checks if the linked list points to itself when registering a VEH, if so it sets peb.CrossProcessFlags:ProcessUsingVEH (this does exactly what it  sounds like, it tells the exception handler that vectored exception handlers are present so it can call them)</p>
+<p>So, now that you know how to locate the entries, you can really easily get the vectored_handler struct instances and now it becomes easy</p>
+<p>Consider the following code:</p>
+<pre class=" language-c"><code class="prism ++ language-c"><span class="token macro property">#<span class="token directive keyword">include</span> <span class="token string">"definitions.h"</span></span>
+<span class="token keyword">int</span> <span class="token function">main</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+<span class="token punctuation">{</span>
+	HANDLE process_handle <span class="token operator">=</span> utils<span class="token punctuation">:</span><span class="token punctuation">:</span><span class="token function">get_process_handle</span><span class="token punctuation">(</span><span class="token string">"SomeProcess.exe"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">if</span><span class="token punctuation">(</span><span class="token operator">!</span>process_handle<span class="token punctuation">)</span>
+	<span class="token punctuation">{</span>
+		std<span class="token punctuation">:</span><span class="token punctuation">:</span><span class="token function">puts</span><span class="token punctuation">(</span><span class="token string">"Error occured while opening process handle.\n"</span><span class="token punctuation">)</span>
+		<span class="token keyword">return</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+	
+	std<span class="token punctuation">:</span><span class="token punctuation">:</span>uintptr_t external_ntdll <span class="token operator">=</span> utils<span class="token punctuation">:</span><span class="token punctuation">:</span><span class="token function">get_module_base</span><span class="token punctuation">(</span>process_handle<span class="token punctuation">,</span><span class="token string">"ntdll.dll"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	utils<span class="token punctuation">:</span><span class="token punctuation">:</span>_PEB64 process_peb <span class="token operator">=</span> utils<span class="token punctuation">:</span><span class="token punctuation">:</span><span class="token function">get_process_peb</span><span class="token punctuation">(</span>process_handle<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">if</span><span class="token punctuation">(</span><span class="token operator">!</span>process_peb<span class="token punctuation">)</span>
+	<span class="token punctuation">{</span>
+		std<span class="token punctuation">:</span><span class="token punctuation">:</span><span class="token function">puts</span><span class="token punctuation">(</span><span class="token string">"Error occured while reading process PEB.\n"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token function">CloseHandle</span><span class="token punctuation">(</span>process_handle<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token keyword">return</span> <span class="token operator">-</span><span class="token number">2</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>	
+	
+	<span class="token keyword">if</span><span class="token punctuation">(</span><span class="token operator">!</span>process_peb<span class="token punctuation">.</span>ProcessUsingVEH<span class="token punctuation">)</span>
+	<span class="token punctuation">{</span>
+		std<span class="token punctuation">:</span><span class="token punctuation">:</span><span class="token function">puts</span><span class="token punctuation">(</span><span class="token string">"Process not using any VEHs!\n"</span><span class="token punctuation">)</span>
+		<span class="token function">CloseHandle</span><span class="token punctuation">(</span>process_handle<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token keyword">return</span> <span class="token operator">-</span><span class="token number">3</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+	
+	std<span class="token punctuation">:</span><span class="token punctuation">:</span>uintptr_t VEH_list_address <span class="token operator">=</span> external_ntdll <span class="token operator">+</span> LdrpVectorHandlerList <span class="token operator">+</span> <span class="token number">8</span> <span class="token operator">+</span> <span class="token number">8</span> <span class="token operator">*</span> <span class="token punctuation">(</span>type<span class="token punctuation">:</span><span class="token punctuation">:</span>VEH <span class="token operator">*</span> <span class="token number">3</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	
+	vectored_handler_entry vh_entry<span class="token punctuation">{</span><span class="token punctuation">}</span><span class="token punctuation">;</span>
+	vectored_handler external_handler<span class="token punctuation">{</span><span class="token punctuation">}</span><span class="token punctuation">;</span>
+	
+	<span class="token keyword">if</span><span class="token punctuation">(</span><span class="token operator">!</span>utils<span class="token punctuation">:</span><span class="token punctuation">:</span><span class="token function">RPM</span><span class="token punctuation">(</span>process_handle<span class="token punctuation">,</span> VEH_list_address<span class="token punctuation">,</span> vh_entry<span class="token punctuation">,</span> <span class="token keyword">sizeof</span><span class="token punctuation">(</span>vh_entry<span class="token punctuation">)</span><span class="token punctuation">)</span>
+	<span class="token punctuation">{</span>
+		std<span class="token punctuation">:</span><span class="token punctuation">:</span><span class="token function">puts</span><span class="token punctuation">(</span><span class="token string">"Error occured while reading external VEH_list.\n"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token function">CloseHandle</span><span class="token punctuation">(</span>process_handle<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token keyword">return</span> <span class="token operator">-</span><span class="token number">4</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+	
+	<span class="token keyword">if</span><span class="token punctuation">(</span><span class="token operator">!</span>utils<span class="token punctuation">:</span><span class="token punctuation">:</span><span class="token function">RPM</span><span class="token punctuation">(</span>process_handle<span class="token punctuation">,</span> vh_entry<span class="token punctuation">.</span>first<span class="token punctuation">,</span> external_handler<span class="token punctuation">,</span><span class="token keyword">sizeof</span><span class="token punctuation">(</span>external_handler<span class="token punctuation">)</span><span class="token punctuation">)</span>
+	<span class="token punctuation">{</span>
+		std<span class="token punctuation">:</span><span class="token punctuation">:</span><span class="token function">puts</span><span class="token punctuation">(</span><span class="token string">"Error occured while getting VEH.\n"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token function">CloseHandle</span><span class="token punctuation">(</span>process_handle<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token keyword">return</span> <span class="token operator">-</span><span class="token number">5</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+	
+	std<span class="token punctuation">:</span><span class="token punctuation">:</span><span class="token function">puts</span><span class="token punctuation">(</span><span class="token string">"Successfully got VEH!\n"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token function">CloseHandle</span><span class="token punctuation">(</span>process_handle<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">return</span> <span class="token number">0</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre>
+<p>Now, there’s only one thing standing in your way, the encoded pointer to the VEH code address!</p>
+<h2 id="rtlencodepointer-and-rtldecodepointer-inner-workings">RtlEncodePointer and RtlDecodePointer inner workings</h2>
+<p>These functions are so small i can just describe them right here right now, its basically just some fuckery with the process cookie</p>
+<p>Here’s the C pseudocode for RtlEncodePointer:</p>
+<pre class=" language-c"><code class="prism ++ language-c"><span class="token comment">//names edited and symbols resolved for ease of reading</span>
+__int64 __fastcall <span class="token function">RtlEncodePointer</span><span class="token punctuation">(</span>__int64 pointer<span class="token punctuation">)</span>
+<span class="token punctuation">{</span>
+	ULONG cookie <span class="token operator">=</span> <span class="token function">RtlpGetCookieValue</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span> <span class="token comment">// process cookie, unique value generated on process creation</span>
+	<span class="token keyword">if</span><span class="token punctuation">(</span><span class="token operator">!</span>cookie<span class="token punctuation">)</span>
+	<span class="token punctuation">{</span>
+		NTSTATUS status<span class="token operator">=</span> <span class="token function">NtQueryInformationProcess</span><span class="token punctuation">(</span><span class="token function">GetCurrentProcess</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span><span class="token number">36</span><span class="token punctuation">,</span><span class="token operator">&amp;</span>cookie<span class="token punctuation">,</span><span class="token keyword">sizeof</span><span class="token punctuation">(</span>cookie<span class="token punctuation">)</span><span class="token punctuation">,</span><span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token keyword">if</span><span class="token punctuation">(</span><span class="token operator">!</span><span class="token function">NT_SUCCESS</span><span class="token punctuation">(</span>status<span class="token punctuation">)</span><span class="token punctuation">)</span>
+			<span class="token function">RtlRaiseStatus</span><span class="token punctuation">(</span>status<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token comment">//0x1D0450 is the offset to ?CookieValue@?1??RtlpGetCookieValue@@9@9 on win11 24h2</span>
+		<span class="token comment">//RtlpGetCookieValue call just resolves to mov rax,?CookieValue@?1??RtlpGetCookieValue@@9@9 afaik</span>
+		<span class="token comment">//so essentially ?CookieValue@?1??RtlpGetCookieValue@@9@9 = cookie</span>
+		<span class="token operator">*</span>reinterpret_cast<span class="token operator">&lt;</span>ULONG<span class="token operator">*</span><span class="token operator">&gt;</span><span class="token punctuation">(</span><span class="token punctuation">(</span>std<span class="token punctuation">:</span><span class="token punctuation">:</span>uintptr_t<span class="token punctuation">)</span><span class="token function">GetModuleHandleA</span><span class="token punctuation">(</span><span class="token string">"ntdll.dll"</span><span class="token punctuation">)</span> <span class="token operator">+</span> <span class="token number">0x1D0450</span><span class="token punctuation">)</span> <span class="token operator">=</span> cookie<span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+	<span class="token keyword">return</span> <span class="token function">__ROR8__</span><span class="token punctuation">(</span>pointer <span class="token operator">^</span> cookie<span class="token punctuation">,</span> cookie <span class="token operator">&amp;</span> <span class="token number">0x3F</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre>
+<p>and the actual assembly:</p>
+<pre class=" language-nasm"><code class="prism  language-nasm"><span class="token comment">;Generated via IDA-&gt;File-&gt;Produce file-&gt;Create ASM file</span>
+<span class="token comment">; __int64 __fastcall RtlEncodePointer(_QWORD)</span>
+public RtlEncodePointer
+RtlEncodePointer proc near
+
+return_length <span class="token operator">=</span> qword ptr <span class="token number">-18h</span>
+ProcessInformation<span class="token operator">=</span> dword ptr  <span class="token number">10h</span>
+
+push    <span class="token register variable">rbx</span>
+sub     <span class="token register variable">rsp</span>, <span class="token number">30h</span>
+and     <span class="token operator">[</span><span class="token register variable">rsp</span><span class="token operator">+</span><span class="token number">38h</span><span class="token operator">+</span>ProcessInformation<span class="token operator">]</span>, <span class="token number">0</span>
+mov     <span class="token register variable">rbx</span>, <span class="token register variable">rcx</span>
+mov     <span class="token register variable">eax</span>, <span class="token register variable">cs</span>:?CookieValue@?<span class="token number">1</span>??RtlpGetCookieValue@@<span class="token number">9</span>@<span class="token number">9</span> <span class="token comment">; `RtlpGetCookieValue'::`2'::CookieValue</span>
+test    <span class="token register variable">eax</span>, <span class="token register variable">eax</span>
+jz      short get_cookie_via_ntqueryinformationprocess
+
+<span class="token label function">encode:</span>
+mov     <span class="token register variable">ecx</span>, <span class="token register variable">eax</span>
+xor     <span class="token register variable">rax</span>, <span class="token register variable">rbx</span>
+and     <span class="token register variable">ecx</span>, <span class="token number">3Fh</span>
+ror     <span class="token register variable">rax</span>, <span class="token register variable">cl</span>
+add     <span class="token register variable">rsp</span>, <span class="token number">30h</span>
+pop     <span class="token register variable">rbx</span>
+retn
+align <span class="token number">2</span>
+
+<span class="token label function">get_cookie_via_ntqueryinformationprocess:</span>
+and     <span class="token operator">[</span><span class="token register variable">rsp</span><span class="token operator">+</span><span class="token number">38h</span><span class="token operator">+</span>return_length<span class="token operator">]</span>, <span class="token number">0</span>
+lea     <span class="token register variable">r8</span>, <span class="token operator">[</span><span class="token register variable">rsp</span><span class="token operator">+</span><span class="token number">38h</span><span class="token operator">+</span>ProcessInformation<span class="token operator">]</span> <span class="token comment">; ProcessInformation</span>
+mov     <span class="token register variable">r9d</span>, <span class="token number">4</span>          <span class="token comment">; ProcessInformationLength</span>
+or      <span class="token register variable">rcx</span>, <span class="token number">0FFFFFFFFFFFFFFFFh</span> <span class="token comment">; ProcessHandle</span>
+lea     <span class="token register variable">edx</span>, <span class="token operator">[</span><span class="token register variable">r9</span><span class="token operator">+</span><span class="token number">20h</span><span class="token operator">]</span>   <span class="token comment">; ProcessInformationClass</span>
+call    NtQueryInformationProcess
+test    <span class="token register variable">eax</span>, <span class="token register variable">eax</span>
+js      short error
+mov     <span class="token register variable">eax</span>, <span class="token operator">[</span><span class="token register variable">rsp</span><span class="token operator">+</span><span class="token number">38h</span><span class="token operator">+</span>ProcessInformation<span class="token operator">]</span>
+mov     <span class="token register variable">cs</span>:?CookieValue@?<span class="token number">1</span>??RtlpGetCookieValue@@<span class="token number">9</span>@<span class="token number">9</span>, <span class="token register variable">eax</span> <span class="token comment">; `RtlpGetCookieValue'::`2'::CookieValue</span>
+jmp     short encode
+
+<span class="token label function">error:</span>
+mov     <span class="token register variable">ecx</span>, <span class="token register variable">eax</span>
+call    RtlRaiseStatus
+db <span class="token number">0CCh</span>
+RtlEncodePointer endp
+</code></pre>
+<p>Now, im sure you already see something interesting, RtlEncodePointer’s NtQueryInformationProcess uses a undocumented ProcessInformationClass, to get the cookie, neat!</p>
+<p>Now we can get the process cookie!</p>
+<p>We can also really easily edit RtlEncodePointer to take a cookie as argument, effectively making our own <code>RtlEncodePointerEx(ULONG cookie, PVOID pointer)</code>!</p>
+<p>Now for RtlDecodePointer, gonna keep it short since its basically the same as RtlEncodePointer</p>
+<p>C Pseudocode:</p>
+<pre class=" language-c"><code class="prism ++ language-c">__int64 __fastcall <span class="token function">RtlDecodePointer</span><span class="token punctuation">(</span>__int64 pointer<span class="token punctuation">)</span>
+<span class="token punctuation">{</span>
+	ULONG cookie <span class="token operator">=</span> <span class="token function">RtlpGetCookieValue</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">if</span><span class="token punctuation">(</span><span class="token operator">!</span>cookie<span class="token punctuation">)</span>
+	<span class="token punctuation">{</span>
+		NTSTATUS status<span class="token operator">=</span> <span class="token function">NtQueryInformationProcess</span><span class="token punctuation">(</span><span class="token function">GetCurrentProcess</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">,</span><span class="token number">36</span><span class="token punctuation">,</span><span class="token operator">&amp;</span>cookie<span class="token punctuation">,</span><span class="token keyword">sizeof</span><span class="token punctuation">(</span>cookie<span class="token punctuation">)</span><span class="token punctuation">,</span><span class="token number">0</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token keyword">if</span><span class="token punctuation">(</span><span class="token operator">!</span><span class="token function">NT_SUCCESS</span><span class="token punctuation">(</span>status<span class="token punctuation">)</span><span class="token punctuation">)</span>
+			<span class="token function">RtlRaiseStatus</span><span class="token punctuation">(</span>status<span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token operator">*</span>reinterpret_cast<span class="token operator">&lt;</span>ULONG<span class="token operator">*</span><span class="token operator">&gt;</span><span class="token punctuation">(</span><span class="token punctuation">(</span>std<span class="token punctuation">:</span><span class="token punctuation">:</span>uintptr_t<span class="token punctuation">)</span><span class="token function">GetModuleHandleA</span><span class="token punctuation">(</span><span class="token string">"ntdll.dll"</span><span class="token punctuation">)</span> <span class="token operator">+</span> <span class="token number">0x1D0450</span><span class="token punctuation">)</span> <span class="token operator">=</span> cookie<span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+	<span class="token keyword">return</span>  <span class="token function">__ROR8__</span><span class="token punctuation">(</span>pointer<span class="token punctuation">,</span> <span class="token number">64</span> <span class="token operator">-</span> <span class="token punctuation">(</span>cookie <span class="token operator">&amp;</span> <span class="token number">0x3F</span><span class="token punctuation">)</span><span class="token punctuation">)</span> <span class="token operator">^</span> cookie<span class="token punctuation">)</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre>
+<p>And the assembly:</p>
+<pre class=" language-nasm"><code class="prism  language-nasm"><span class="token comment">;Generated via IDA-&gt;File-&gt;Produce file-&gt;Create ASM file</span>
+public RtlDecodePointer
+RtlDecodePointer proc near
+
+ReturnLength<span class="token operator">=</span> qword ptr <span class="token number">-18h</span>
+ProcessInformation<span class="token operator">=</span> dword ptr  <span class="token number">10h</span>
+
+push    <span class="token register variable">rbx</span>
+sub     <span class="token register variable">rsp</span>, <span class="token number">30h</span>
+mov     <span class="token register variable">edx</span>, <span class="token register variable">cs</span>:?CookieValue@?<span class="token number">1</span>??RtlpGetCookieValue@@<span class="token number">9</span>@<span class="token number">9</span> <span class="token comment">; `RtlpGetCookieValue'::`2'::CookieValue</span>
+xor     <span class="token register variable">eax</span>, <span class="token register variable">eax</span>
+mov     <span class="token operator">[</span><span class="token register variable">rsp</span><span class="token operator">+</span><span class="token number">38h</span><span class="token operator">+</span>ProcessInformation<span class="token operator">]</span>, <span class="token register variable">eax</span>
+mov     <span class="token register variable">rbx</span>, <span class="token register variable">rcx</span>
+test    <span class="token register variable">edx</span>, <span class="token register variable">edx</span>
+jz      short get_cookie_via_ntqueryinformationprocess
+
+<span class="token label function">decode:</span>
+mov     <span class="token register variable">eax</span>, <span class="token register variable">edx</span>
+mov     <span class="token register variable">ecx</span>, <span class="token number">40h</span> <span class="token comment">; '@'</span>
+and     <span class="token register variable">eax</span>, <span class="token number">3Fh</span>
+sub     <span class="token register variable">ecx</span>, <span class="token register variable">eax</span>
+mov     <span class="token register variable">eax</span>, <span class="token register variable">edx</span>
+ror     <span class="token register variable">rbx</span>, <span class="token register variable">cl</span>
+xor     <span class="token register variable">rax</span>, <span class="token register variable">rbx</span>
+add     <span class="token register variable">rsp</span>, <span class="token number">30h</span>
+pop     <span class="token register variable">rbx</span>
+retn
+align <span class="token number">4</span>
+
+<span class="token label function">get_cookie_via_ntqueryinformationprocess:</span>          <span class="token comment">; ProcessInformationLength</span>
+mov     <span class="token register variable">r9d</span>, <span class="token number">4</span>
+mov     <span class="token operator">[</span><span class="token register variable">rsp</span><span class="token operator">+</span><span class="token number">38h</span><span class="token operator">+</span>ReturnLength<span class="token operator">]</span>, <span class="token register variable">rax</span> <span class="token comment">; ReturnLength</span>
+lea     <span class="token register variable">r8</span>, <span class="token operator">[</span><span class="token register variable">rsp</span><span class="token operator">+</span><span class="token number">38h</span><span class="token operator">+</span>ProcessInformation<span class="token operator">]</span> <span class="token comment">; ProcessInformation</span>
+mov     <span class="token register variable">rcx</span>, <span class="token number">0FFFFFFFFFFFFFFFFh</span> <span class="token comment">; ProcessHandle</span>
+lea     <span class="token register variable">edx</span>, <span class="token operator">[</span><span class="token register variable">r9</span><span class="token operator">+</span><span class="token number">20h</span><span class="token operator">]</span>   <span class="token comment">; ProcessInformationClass</span>
+call    NtQueryInformationProcess
+test    <span class="token register variable">eax</span>, <span class="token register variable">eax</span>
+js      short error
+mov     <span class="token register variable">edx</span>, <span class="token operator">[</span><span class="token register variable">rsp</span><span class="token operator">+</span><span class="token number">38h</span><span class="token operator">+</span>ProcessInformation<span class="token operator">]</span>
+mov     <span class="token register variable">cs</span>:?CookieValue@?<span class="token number">1</span>??RtlpGetCookieValue@@<span class="token number">9</span>@<span class="token number">9</span>, <span class="token register variable">edx</span> <span class="token comment">; `RtlpGetCookieValue'::`2'::CookieValue</span>
+jmp     short decode
+
+<span class="token label function">error:</span>
+mov     <span class="token register variable">ecx</span>, <span class="token register variable">eax</span>
+call    RtlRaiseStatus
+db <span class="token number">0CCh</span>
+RtlDecodePointer endp
+</code></pre>
+<p>So now that you have the pseudocode and assembly for both RtlEncodePointer and RtlDecodePointer you probably already see how you can abuse them, since its purely arthritmic instructions to encode and decode the only thing you need is the process cookie, and you already know how to get it!</p>
+<p>so, now you know how to get a vectored_handler instance and how to encode and decode pointers using another processes cookie, so now you can start dumping!</p>
+<p>Here’s a simple VEH address dumper:</p>
+<pre class=" language-c"><code class="prism ++ language-c"><span class="token comment">//you can write these functions yourself now, i wont spoonfeed you :P</span>
+<span class="token macro property">#<span class="token directive keyword">include</span> <span class="token string">"definitions.h"</span></span>
+<span class="token keyword">int</span> <span class="token function">main</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+<span class="token punctuation">{</span>
+	HANDLE process_handle <span class="token operator">=</span> utils<span class="token punctuation">:</span><span class="token punctuation">:</span><span class="token function">get_process_handle</span><span class="token punctuation">(</span><span class="token string">"RandomProcess.exe"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+	vectored_handler external_handler <span class="token operator">=</span> utils<span class="token punctuation">:</span><span class="token punctuation">:</span><span class="token function">get_first_handler</span><span class="token punctuation">(</span>process_handle<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	
+	<span class="token keyword">if</span><span class="token punctuation">(</span><span class="token operator">!</span>external_handler<span class="token punctuation">)</span>
+	<span class="token punctuation">{</span>
+		std<span class="token punctuation">:</span><span class="token punctuation">:</span><span class="token function">puts</span><span class="token punctuation">(</span><span class="token string">"No VEH found!\n"</span><span class="token punctuation">)</span><span class="token punctuation">;</span>
+		<span class="token keyword">return</span> <span class="token operator">-</span><span class="token number">1</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+	
+	ULONG process_cookie <span class="token operator">=</span> utils<span class="token punctuation">:</span><span class="token punctuation">:</span><span class="token function">get_process_cookie</span><span class="token punctuation">(</span>process_handle<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	
+	<span class="token keyword">if</span><span class="token punctuation">(</span><span class="token operator">!</span>process_cookie<span class="token punctuation">)</span>
+	<span class="token punctuation">{</span>
+		std<span class="token punctuation">:</span><span class="token punctuation">:</span><span class="token function">puts</span><span class="token punctuation">(</span><span class="token string">"Error occured while fetching process cookie.\n"</span><span class="token punctuation">)</span>
+		<span class="token keyword">return</span> <span class="token operator">-</span><span class="token number">2</span><span class="token punctuation">;</span>
+	<span class="token punctuation">}</span>
+	
+	std<span class="token punctuation">:</span><span class="token punctuation">:</span>uintptr_t VEH_address <span class="token operator">=</span> utils<span class="token punctuation">:</span><span class="token punctuation">:</span><span class="token function">decode_ptr</span><span class="token punctuation">(</span>process_cookie<span class="token punctuation">,</span>external_handler<span class="token punctuation">.</span>encoded_ptr<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	
+	std<span class="token punctuation">:</span><span class="token punctuation">:</span><span class="token function">printf</span><span class="token punctuation">(</span><span class="token string">"Decoded VEH address: %p\n"</span><span class="token punctuation">,</span>VEH_address<span class="token punctuation">)</span><span class="token punctuation">;</span>
+	<span class="token keyword">return</span> <span class="token number">1</span><span class="token punctuation">;</span>
+<span class="token punctuation">}</span>
+</code></pre>
+<p>Easy enough right?<br>
+Now onto the REAL meat: Injecting a custom VEH!</p>
+<h2 id="veh-injection">VEH injection</h2>
+<p>So, now that you’ve learned where VEH’s are stored, what format they are stored in and how to get the process cookie to decode and encode pointers you can inject your own!</p>
+<p>The theory for this is really <strong>REALLY</strong> simple:</p>
+<ol>
+<li>
+<p>Get address of vh_entry</p>
+</li>
+<li>
+<p>If you want to be called first, get the vectored_handler struct at vh_entry.first, else get vh_entry.last</p>
+</li>
+<li>
+<p>allocate memory into target process for 3 things:</p>
+<ul>
+<li>The “function” (shellcode) that you want to be called</li>
+<li>The handler struct itself</li>
+<li>handler.unkown_ptr memory, 8 bytes, set to 1, LdrpCallVectoredHandlers bullshit</li>
+</ul>
+</li>
+<li>
+<p>Setup handler struct</p>
+<ul>
+<li>If first, copy vh_entry.first-&gt;blink into your handler.blink, and copy vh_entry.first into your handler.flink</li>
+<li>If last, copy vh_entry.last-&gt;flink into your flink and copy vh_entry.last into your handler.blink</li>
+<li>Encode the ptr to allocated shellcode memory and set handler.encoded_ptr to it</li>
+<li>Set unkown_ptr to the memory you allocated for it</li>
+</ul>
+</li>
+<li>
+<p>Write handler struct to allocated memory</p>
+</li>
+<li>
+<p>Overwrite memory to put your handler into the linked list</p>
+<ul>
+<li>
+<p>If first, overwrite vh_entry.first-&gt;blink to contain the address of your handler struct and overwrite vh_entry.first to contain the address of your handler struct</p>
+</li>
+<li>
+<p>If last, overwrite vh_entry.last-&gt;flink to contain the address of your handler struct and overwrite vh_entry.last to contain the address of your handler struct</p>
+</li>
+</ul>
+</li>
+<li>
+<p>Profit!</p>
+</li>
+</ol>
+<p>Now for the code ,you should’ve learned enough to do it yourself now, so i won’t give it ;P</p>
+<h1 id="important-notes">IMPORTANT NOTES</h1>
+<ol>
+<li>
+<p>VEH’s will not be called if peb.CrossProcessFlags:ProcessUsingVEH is not set</p>
+</li>
+<li>
+<p>LdrpVectorHandlerList is PAGE_READONLY protected since its in mrdata, you might need to set protection to PAGE_READWRITE before ovewriting vh_entry!</p>
+</li>
+<li>
+<p>This is NOT thread safe! The original RtlpAddVectoredHandler acquires an exclusive <a href="https://learn.microsoft.com/en-us/windows/win32/sync/slim-reader-writer--srw--locks">SRW</a> lock on LdrpVectorHandlerList!</p>
+</li>
+</ol>
+<h1 id="references">References</h1>
+<p><a href="https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-rtlallocateheap">RtlAllocateHeap</a><br>
+<a href="https://doxygen.reactos.org/dd/df3/env__spec__w32_8h.html#a14f3c1fe642e4927959b4beed2852e2a">InsertHead/TailList</a><br>
+<a href="https://learn.microsoft.com/en-us/cpp/intrinsics/fastfail?view=msvc-170">__fastfail</a><br>
+<a href="https://www.vergiliusproject.com/kernels/x64/windows-11/24h2/_PEB64">_PEB64</a></p>
+
+    </div>
+  </div>
+</body>
+
+</html>
