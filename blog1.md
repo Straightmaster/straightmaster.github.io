@@ -67,11 +67,14 @@ struct vectored_handler_entrypoint // structure found at NTDLL+LdrpVectoredHandl
 
 
 flowchart TD
-Phase0["Kernel32.AddVectored(Exception/Continue)Handler\nARGS(First,Handler)"] 
+Phase0["Kernel32.AddVectored(Exception/Continue)Handler
+ARGS(First,Handler)"] 
 -- FORWARDED EXPORT--> 
-Phase1["ntdll.RtlAddVectored(Exception/Continue)Handler\nARGS(First,Handler)"]
+Phase1["ntdll.RtlAddVectored(Exception/Continue)Handler
+ARGS(First,Handler)"]
 -- CALLS --> 
-Phase2["ntdll.RtlpAddVectoredHandler\nARGS(First,Handler,Type(if VEH then 0,if VCH then 1))"]
+Phase2["ntdll.RtlpAddVectoredHandler
+ARGS(First,Handler,Type(if VEH then 0,if VCH then 1))"]
 
 Phase2 -- "If LdrControlFlowGuardEnforced()" --> Phase3.1["PVOID Heap = LdrpMrdataHeap"]
 Phase2 -- Else --> Phase3.2["PVOID Heap = GetCurrentPeb()->ProcessHeap"]
